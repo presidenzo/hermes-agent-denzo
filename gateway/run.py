@@ -2745,6 +2745,9 @@ class GatewayRunner:
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
+        if canonical == "tokens":
+            return await self._handle_tokens_command(event)
+
         if canonical == "insights":
             return await self._handle_insights_command(event)
 
@@ -3759,10 +3762,11 @@ class GatewayRunner:
             
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
-            # compression decisions.
+            # compression decisions. Sync total_tokens so /status shows accurate counts.
             self.session_store.update_session(
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+                total_tokens=agent_result.get("total_tokens", 0),
             )
 
             # Auto voice reply: send TTS audio before the text response
@@ -5913,7 +5917,7 @@ class GatewayRunner:
             self.session_store.rewrite_transcript(new_session_id, compressed)
             # Reset stored token count — transcript changed, old value is stale
             self.session_store.update_session(
-                session_entry.session_key, last_prompt_tokens=0
+                session_entry.session_key, last_prompt_tokens=0, total_tokens=0
             )
             new_tokens = estimate_messages_tokens_rough(compressed)
             summary = summarize_manual_compression(
@@ -6242,6 +6246,101 @@ class GatewayRunner:
                 f"_(Detailed usage available after the first agent response)_"
             )
         return "No usage data available for this session."
+
+    async def _handle_tokens_command(self, event: MessageEvent) -> str:
+        """Handle /tokens -- show per-turn token breakdown for the current session."""
+        import json
+        import glob
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        # Get session ID from store
+        session_entry = self.session_store.get_or_create_session(source)
+        session_id = session_entry.session_id if session_entry else ""
+
+        if not session_id:
+            return "(._.) No active session."
+
+        # Find JSONL transcript
+        transcript_path = self.session_store.get_transcript_path(session_id)
+        if not transcript_path.exists():
+            # Try fuzzy match
+            sessions_dir = transcript_path.parent
+            pattern = os.path.join(sessions_dir, f"*{session_id[-8:]}*.jsonl")
+            files = sorted(glob.glob(str(pattern)), key=os.path.getmtime, reverse=True)
+            if not files:
+                return f"(._.) No transcript found."
+            transcript_path = type(transcript_path)(files[0])
+
+        turns = []
+        with open(transcript_path) as f:
+            for line in f:
+                obj = json.loads(line.strip())
+                if obj.get("role") == "assistant":
+                    usage = obj.get("usage", {})
+                    cost = obj.get("cost", {})
+                    content = (obj.get("content") or "")[:50].replace("\n", " ")
+                    tool_calls = obj.get("tool_calls", [])
+                    tool_names = [tc.get("function", {}).get("name", "?") for tc in tool_calls][:2] if tool_calls else []
+                    turns.append({
+                        "usage": usage,
+                        "cost": cost,
+                        "preview": content,
+                        "tools": tool_names,
+                    })
+
+        if not turns:
+            return "(._.) No assistant turns found."
+
+        has_usage = any(t["usage"] for t in turns)
+
+        if not has_usage:
+            lines = [f"⚠ {len(turns)} turns, but no per-turn usage data (pre-patch session)."]
+            # Fall back to agent aggregate
+            agent = self._running_agents.get(session_key)
+            if not agent:
+                _cache = getattr(self, "_agent_cache", None)
+                if _cache:
+                    cached = _cache.get(session_key)
+                    if cached:
+                        agent = cached[0]
+            if agent and hasattr(agent, "session_input_tokens"):
+                inp = getattr(agent, "session_input_tokens", 0) or 0
+                out = getattr(agent, "session_output_tokens", 0) or 0
+                cr = getattr(agent, "session_cache_read_tokens", 0) or 0
+                total = getattr(agent, "session_total_tokens", 0) or 0
+                lines.append(f"Aggregate: in={inp:,} out={out:,} cache={cr:,} total={total:,}")
+            return "\n".join(lines)
+
+        def _fmt(n):
+            if n >= 1_000_000: return f"{n/1e6:.1f}M"
+            if n >= 1_000: return f"{n/1e3:.0f}K"
+            return str(n)
+
+        lines = [f"📊 Per-Turn Tokens ({len(turns)} turns)\n"]
+        total_in = total_out = total_cr = 0
+        total_cost = 0.0
+
+        for i, t in enumerate(turns):
+            u = t["usage"]
+            c = t["cost"]
+            inp = u.get("input", 0)
+            out = u.get("output", 0)
+            cr = u.get("cache_read", 0)
+            cost_usd = c.get("amount_usd") or 0.0
+
+            total_in += inp
+            total_out += out
+            total_cr += cr
+            total_cost += cost_usd
+
+            tools = ",".join(t["tools"]) if t["tools"] else "-"
+            lines.append(f"{i+1:>2}. {_fmt(inp)} in  {_fmt(out)} out  ${cost_usd:.4f}  {tools}")
+
+        lines.append(f"\nTotal: {_fmt(total_in)} in  {_fmt(total_out)} out  {_fmt(total_cr)} cache  ${total_cost:.4f}")
+
+        return "\n".join(lines)
 
     async def _handle_insights_command(self, event: MessageEvent) -> str:
         """Handle /insights command -- show usage insights and analytics."""
@@ -8104,11 +8203,13 @@ class GatewayRunner:
             _last_prompt_toks = 0
             _input_toks = 0
             _output_toks = 0
+            _total_toks = 0
             _agent = agent_holder[0]
             if _agent and hasattr(_agent, "context_compressor"):
                 _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
                 _input_toks = getattr(_agent, "session_prompt_tokens", 0)
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
+                _total_toks = getattr(_agent, "session_total_tokens", 0)
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
@@ -8122,6 +8223,7 @@ class GatewayRunner:
                     "last_prompt_tokens": _last_prompt_toks,
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
+                    "total_tokens": _total_toks,
                     "model": _resolved_model,
                 }
             
@@ -8211,6 +8313,7 @@ class GatewayRunner:
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
+                "total_tokens": _total_toks,
                 "model": _resolved_model,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),

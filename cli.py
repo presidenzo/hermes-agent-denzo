@@ -5499,6 +5499,8 @@ class HermesCLI:
             self._manual_compress(cmd_original)
         elif canonical == "usage":
             self._show_usage()
+        elif canonical == "tokens":
+            self._show_tokens(cmd_original)
         elif canonical == "insights":
             self._show_insights(cmd_original)
         elif canonical == "debug":
@@ -6517,6 +6519,95 @@ class HermesCLI:
             logging.getLogger().setLevel(logging.INFO)
             for quiet_logger in ('tools', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
                 logging.getLogger(quiet_logger).setLevel(logging.ERROR)
+
+    def _show_tokens(self, command: str = ""):
+        """Show per-turn token breakdown for the current or specified session."""
+        import glob
+        import json
+
+        sessions_dir = os.path.expanduser("~/.hermes/sessions/")
+
+        # Determine session ID: from arg or current session
+        session_id = command.strip() if command.strip() else ""
+        if not session_id:
+            session_id = getattr(self, "session_id", "") or ""
+
+        if not session_id:
+            print("(._.) No session ID. Use /tokens <session_id> or run in an active session.")
+            return
+
+        # Find JSONL file
+        pattern = os.path.join(sessions_dir, f"*{session_id}*.jsonl")
+        files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+        if not files:
+            print(f"(._.) No transcript found for '{session_id}'.")
+            return
+
+        turns = []
+        with open(files[0]) as f:
+            for line in f:
+                obj = json.loads(line.strip())
+                if obj.get("role") == "assistant":
+                    usage = obj.get("usage", {})
+                    cost = obj.get("cost", {})
+                    content = (obj.get("content") or "")[:60].replace("\n", " ")
+                    tool_calls = obj.get("tool_calls", [])
+                    tool_names = [tc.get("function", {}).get("name", "?") for tc in tool_calls] if tool_calls else []
+                    turns.append({
+                        "usage": usage,
+                        "cost": cost,
+                        "preview": content,
+                        "tools": tool_names,
+                    })
+
+        if not turns:
+            print("(._.) No assistant turns found.")
+            return
+
+        has_usage = any(t["usage"] for t in turns)
+
+        if not has_usage:
+            print(f"⚠ {len(turns)} turns, but no per-turn usage data.")
+            print("  Sessões antes do patch não têm esse dado.")
+            # Fall back to session aggregate
+            if self.agent and hasattr(self.agent, "session_input_tokens"):
+                inp = getattr(self.agent, "session_input_tokens", 0) or 0
+                out = getattr(self.agent, "session_output_tokens", 0) or 0
+                cr = getattr(self.agent, "session_cache_read_tokens", 0) or 0
+                total = getattr(self.agent, "session_total_tokens", 0) or 0
+                print(f"\n  Aggregate: in={inp:,} out={out:,} cache={cr:,} total={total:,}")
+            return
+
+        def _fmt(n):
+            if n >= 1_000_000: return f"{n/1e6:.1f}M"
+            if n >= 1_000: return f"{n/1e3:.0f}K"
+            return str(n)
+
+        lines = [f"📊 **Per-Turn Tokens** ({len(turns)} turns)\n"]
+        total_in = total_out = total_cr = 0
+        total_cost = 0.0
+
+        for i, t in enumerate(turns):
+            u = t["usage"]
+            c = t["cost"]
+            inp = u.get("input", 0)
+            out = u.get("output", 0)
+            cr = u.get("cache_read", 0)
+            cost_usd = c.get("amount_usd") or 0.0
+
+            total_in += inp
+            total_out += out
+            total_cr += cr
+            total_cost += cost_usd
+
+            tools = ",".join(t["tools"][:2]) if t["tools"] else "-"
+            preview = t["preview"][:35]
+
+            lines.append(f"`{i+1:>2}` {_fmt(inp):>6} in  {_fmt(out):>6} out  ${cost_usd:.4f}  {tools}")
+
+        lines.append(f"\n**Total:** {_fmt(total_in)} in  {_fmt(total_out)} out  {_fmt(total_cr)} cache  ${total_cost:.4f}")
+
+        return "\n".join(lines)
 
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history."""
