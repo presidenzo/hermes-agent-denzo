@@ -1400,6 +1400,8 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self._last_turn_usage = {}
+        self._last_turn_cost = {}
         
         # ── Ollama num_ctx injection ──
         # Ollama defaults to 2048 context regardless of the model's capabilities.
@@ -1501,6 +1503,8 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self._last_turn_usage = {}
+        self._last_turn_cost = {}
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
@@ -6512,6 +6516,12 @@ class AIAgent:
                 tool_calls.append(tc_dict)
             msg["tool_calls"] = tool_calls
 
+        # Per-turn token usage and cost (for transcript-level tracking)
+        if hasattr(self, "_last_turn_usage") and self._last_turn_usage:
+            msg["usage"] = dict(self._last_turn_usage)
+        if hasattr(self, "_last_turn_cost") and self._last_turn_cost:
+            msg["cost"] = dict(self._last_turn_cost)
+
         return msg
 
     @staticmethod
@@ -8759,6 +8769,20 @@ class AIAgent:
                             self.session_estimated_cost_usd += float(cost_result.amount_usd)
                         self.session_cost_status = cost_result.status
                         self.session_cost_source = cost_result.source
+
+                        # Store per-turn usage/cost for message-level persistence
+                        self._last_turn_usage = {
+                            "input": canonical_usage.input_tokens,
+                            "output": canonical_usage.output_tokens,
+                            "cache_read": canonical_usage.cache_read_tokens,
+                            "cache_write": canonical_usage.cache_write_tokens,
+                            "reasoning": canonical_usage.reasoning_tokens,
+                        }
+                        self._last_turn_cost = {
+                            "amount_usd": float(cost_result.amount_usd) if cost_result.amount_usd is not None else None,
+                            "status": cost_result.status,
+                            "source": cost_result.source,
+                        }
 
                         # Persist token counts to session DB for /insights.
                         # Do this for every platform with a session_id so non-CLI
