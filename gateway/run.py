@@ -3759,10 +3759,11 @@ class GatewayRunner:
             
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
-            # compression decisions.
+            # compression decisions. Sync total_tokens so /status shows accurate counts.
             self.session_store.update_session(
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+                total_tokens=agent_result.get("total_tokens", 0),
             )
 
             # Auto voice reply: send TTS audio before the text response
@@ -5913,7 +5914,7 @@ class GatewayRunner:
             self.session_store.rewrite_transcript(new_session_id, compressed)
             # Reset stored token count — transcript changed, old value is stale
             self.session_store.update_session(
-                session_entry.session_key, last_prompt_tokens=0
+                session_entry.session_key, last_prompt_tokens=0, total_tokens=0
             )
             new_tokens = estimate_messages_tokens_rough(compressed)
             summary = summarize_manual_compression(
