@@ -1361,7 +1361,10 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         session_info["_first_nav"] = False
         _maybe_start_recording(effective_task_id)
     
-    result = _run_browser_command(effective_task_id, "open", [url], timeout=max(_get_command_timeout(), 60))
+    result = _run_browser_command(
+        effective_task_id, "open", [url],
+        timeout=max(_get_command_timeout(), 120),
+    )
     
     if result.get("success"):
         data = result.get("data", {})
